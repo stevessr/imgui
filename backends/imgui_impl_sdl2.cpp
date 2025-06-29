@@ -21,6 +21,7 @@
 
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
+//  2025-06-11: Added ImGui_ImplSDL2_GetContentScaleForWindow(SDL_Window* window) and ImGui_ImplSDL2_GetContentScaleForDisplay(int display_index) helper to facilitate making DPI-aware apps.
 //  2025-04-09: Don't attempt to call SDL_CaptureMouse() on drivers where we don't call SDL_GetGlobalMouseState(). (#8561)
 //  2025-03-21: Fill gamepad inputs and set ImGuiBackendFlags_HasGamepad regardless of ImGuiConfigFlags_NavEnableGamepad being set.
 //  2025-03-10: When dealing with OEM keys, use scancodes instead of translated keycodes to choose ImGuiKey values. (#7136, #7201, #7206, #7306, #7670, #7672, #8468)
@@ -103,6 +104,7 @@
 // Clang warnings with -Weverything
 #if defined(__clang__)
 #pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wold-style-cast"                 // warning: use of old-style cast
 #pragma clang diagnostic ignored "-Wimplicit-int-float-conversion"  // warning: implicit conversion from 'xxx' to 'float' may lose precision
 #endif
 
@@ -116,12 +118,16 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten/em_js.h>
 #endif
+#ifdef Status // X11 headers
+#undef Status
+#endif
 
 #if SDL_VERSION_ATLEAST(2,0,4) && !defined(__EMSCRIPTEN__) && !defined(__ANDROID__) && !(defined(__APPLE__) && TARGET_OS_IOS) && !defined(__amigaos4__)
 #define SDL_HAS_CAPTURE_AND_GLOBAL_MOUSE    1
 #else
 #define SDL_HAS_CAPTURE_AND_GLOBAL_MOUSE    0
 #endif
+#define SDL_HAS_PER_MONITOR_DPI             SDL_VERSION_ATLEAST(2,0,4)
 #define SDL_HAS_VULKAN                      SDL_VERSION_ATLEAST(2,0,6)
 #define SDL_HAS_OPEN_URL                    SDL_VERSION_ATLEAST(2,0,14)
 #if SDL_HAS_VULKAN
@@ -432,7 +438,7 @@ bool ImGui_ImplSDL2_ProcessEvent(const SDL_Event* event)
             //    (event->type == SDL_KEYDOWN) ? "DOWN" : "UP  ", event->key.keysym.sym, SDL_GetKeyName(event->key.keysym.sym), event->key.keysym.scancode, SDL_GetScancodeName(event->key.keysym.scancode), event->key.keysym.mod);
             ImGuiKey key = ImGui_ImplSDL2_KeyEventToImGuiKey(event->key.keysym.sym, event->key.keysym.scancode);
             io.AddKeyEvent(key, (event->type == SDL_KEYDOWN));
-            io.SetKeyEventNativeData(key, event->key.keysym.sym, event->key.keysym.scancode, event->key.keysym.scancode); // To support legacy indexing (<1.87 user code). Legacy backend uses SDLK_*** as indices to IsKeyXXX() functions.
+            io.SetKeyEventNativeData(key, (int)event->key.keysym.sym, (int)event->key.keysym.scancode, (int)event->key.keysym.scancode); // To support legacy indexing (<1.87 user code). Legacy backend uses SDLK_*** as indices to IsKeyXXX() functions.
             return true;
         }
         case SDL_WINDOWEVENT:
@@ -464,6 +470,8 @@ bool ImGui_ImplSDL2_ProcessEvent(const SDL_Event* event)
             bd->WantUpdateGamepadsList = true;
             return true;
         }
+        default:
+            break;
     }
     return false;
 }
@@ -702,6 +710,27 @@ static void ImGui_ImplSDL2_UpdateMouseCursor()
     }
 }
 
+// - On Windows the process needs to be marked DPI-aware!! SDL2 doesn't do it by default. You can call ::SetProcessDPIAware() or call ImGui_ImplWin32_EnableDpiAwareness() from Win32 backend.
+// - Apple platforms use FramebufferScale so we always return 1.0f.
+// - Some accessibility applications are declaring virtual monitors with a DPI of 0.0f, see #7902. We preserve this value for caller to handle.
+float ImGui_ImplSDL2_GetContentScaleForWindow(SDL_Window* window)
+{
+    return ImGui_ImplSDL2_GetContentScaleForDisplay(SDL_GetWindowDisplayIndex(window));
+}
+
+float ImGui_ImplSDL2_GetContentScaleForDisplay(int display_index)
+{
+#if SDL_HAS_PER_MONITOR_DPI
+#ifndef __APPLE__
+    float dpi = 0.0f;
+    if (SDL_GetDisplayDPI(display_index, &dpi, nullptr, nullptr) == 0)
+        return dpi / 96.0f;
+#endif
+#endif
+    IM_UNUSED(display_index);
+    return 1.0f;
+}
+
 static void ImGui_ImplSDL2_CloseGamepads()
 {
     ImGui_ImplSDL2_Data* bd = ImGui_ImplSDL2_GetBackendData();
@@ -804,29 +833,35 @@ static void ImGui_ImplSDL2_UpdateGamepads()
     ImGui_ImplSDL2_UpdateGamepadAnalog(bd, io, ImGuiKey_GamepadRStickDown,  SDL_CONTROLLER_AXIS_RIGHTY, +thumb_dead_zone, +32767);
 }
 
+static void ImGui_ImplSDL2_GetWindowSizeAndFramebufferScale(SDL_Window* window, SDL_Renderer* renderer, ImVec2* out_size, ImVec2* out_framebuffer_scale)
+{
+    int w, h;
+    int display_w, display_h;
+    SDL_GetWindowSize(window, &w, &h);
+    if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)
+        w = h = 0;
+    if (renderer != nullptr)
+        SDL_GetRendererOutputSize(renderer, &display_w, &display_h);
+#if SDL_HAS_VULKAN
+    else if (SDL_GetWindowFlags(window) & SDL_WINDOW_VULKAN)
+        SDL_Vulkan_GetDrawableSize(window, &display_w, &display_h);
+#endif
+    else
+        SDL_GL_GetDrawableSize(window, &display_w, &display_h);
+    if (out_size != nullptr)
+        *out_size = ImVec2((float)w, (float)h);
+    if (out_framebuffer_scale != nullptr)
+        *out_framebuffer_scale = (w > 0 && h > 0) ? ImVec2((float)display_w / w, (float)display_h / h) : ImVec2(1.0f, 1.0f);
+}
+
 void ImGui_ImplSDL2_NewFrame()
 {
     ImGui_ImplSDL2_Data* bd = ImGui_ImplSDL2_GetBackendData();
     IM_ASSERT(bd != nullptr && "Context or backend not initialized! Did you call ImGui_ImplSDL2_Init()?");
     ImGuiIO& io = ImGui::GetIO();
 
-    // Setup display size (every frame to accommodate for window resizing)
-    int w, h;
-    int display_w, display_h;
-    SDL_GetWindowSize(bd->Window, &w, &h);
-    if (SDL_GetWindowFlags(bd->Window) & SDL_WINDOW_MINIMIZED)
-        w = h = 0;
-    if (bd->Renderer != nullptr)
-        SDL_GetRendererOutputSize(bd->Renderer, &display_w, &display_h);
-#if SDL_HAS_VULKAN
-    else if (SDL_GetWindowFlags(bd->Window) & SDL_WINDOW_VULKAN)
-        SDL_Vulkan_GetDrawableSize(bd->Window, &display_w, &display_h);
-#endif
-    else
-        SDL_GL_GetDrawableSize(bd->Window, &display_w, &display_h);
-    io.DisplaySize = ImVec2((float)w, (float)h);
-    if (w > 0 && h > 0)
-        io.DisplayFramebufferScale = ImVec2((float)display_w / w, (float)display_h / h);
+    // Setup main viewport size (every frame to accommodate for window resizing)
+    ImGui_ImplSDL2_GetWindowSizeAndFramebufferScale(bd->Window, bd->Renderer, &io.DisplaySize, &io.DisplayFramebufferScale);
 
     // Setup time step (we don't use SDL_GetTicks() because it is using millisecond resolution)
     // (Accept SDL_GetPerformanceCounter() not returning a monotonically increasing value. Happens in VMs and Emscripten, see #6189, #6114, #3644)
